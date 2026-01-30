@@ -165,6 +165,12 @@ public:
 
     /// This is a scope of friend declaration.
     FriendScope = 0x80000000,
+
+    /// This is a scope of generic association names: This scope begins at the :
+    /// after the declaration name or default identifier and ends at the
+    /// terminating , // or ) of that generic selection’s generic association
+    /// (6.5.2.1). It always has DeclScope as well.
+    AssocationScope = 0x100000000,
   };
 
 private:
@@ -174,7 +180,7 @@ private:
 
   /// Flags - This contains a set of ScopeFlags, which indicates how the scope
   /// interrelates with other control flow statements.
-  unsigned Flags;
+  unsigned long Flags;
 
   /// Depth - This is the depth of this scope.  The translation-unit scope has
   /// depth 0.

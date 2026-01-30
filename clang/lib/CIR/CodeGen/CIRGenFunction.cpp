@@ -17,6 +17,7 @@
 #include "CIRGenValue.h"
 #include "mlir/IR/Location.h"
 #include "clang/AST/Attr.h"
+#include "clang/AST/Decl.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/GlobalDecl.h"
 #include "clang/CIR/Dialect/IR/CIRDialect.h"
@@ -1309,6 +1310,18 @@ LValue CIRGenFunction::emitLValue(const Expr *e) {
     return emitOpaqueValueLValue(cast<OpaqueValueExpr>(e));
   case Expr::SubstNonTypeTemplateParmExprClass:
     return emitLValue(cast<SubstNonTypeTemplateParmExpr>(e)->getReplacement());
+  case Expr::ParenExprClass:
+    return emitLValue(cast<ParenExpr>(e)->getSubExpr());
+  case Expr::GenericSelectionExprClass: {
+    auto *ge = cast<GenericSelectionExpr>(e);
+    const VarDecl *vd = ge->getResultDecl();
+    if (vd) {
+      emitVarDecl(*vd);
+    }
+    return emitLValue(cast<GenericSelectionExpr>(e)->getResultExpr());
+  }
+  case Expr::DeclRefExprClass:
+    return emitDeclRefLValue(cast<DeclRefExpr>(e));
   case Expr::ImplicitCastExprClass:
   case Expr::CStyleCastExprClass:
   case Expr::CXXFunctionalCastExprClass:

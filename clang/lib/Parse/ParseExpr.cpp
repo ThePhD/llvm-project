@@ -22,16 +22,27 @@
 
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/Availability.h"
+#include "clang/AST/Decl.h"
+#include "clang/AST/DeclBase.h"
+#include "clang/AST/Expr.h"
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/LocInfoType.h"
+#include "clang/AST/Stmt.h"
+#include "clang/AST/TypeBase.h"
+#include "clang/Basic/IdentifierTable.h"
+#include "clang/Basic/LangOptions.h"
 #include "clang/Basic/PrettyStackTrace.h"
+#include "clang/Basic/SourceLocation.h"
+#include "clang/Basic/Specifiers.h"
 #include "clang/Lex/LiteralSupport.h"
 #include "clang/Parse/Parser.h"
 #include "clang/Parse/RAIIObjectsForParser.h"
 #include "clang/Sema/DeclSpec.h"
 #include "clang/Sema/EnterExpressionEvaluationContext.h"
+#include "clang/Sema/Ownership.h"
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
+#include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaCUDA.h"
 #include "clang/Sema/SemaCodeCompletion.h"
 #include "clang/Sema/SemaObjC.h"
@@ -40,7 +51,9 @@
 #include "clang/Sema/SemaSYCL.h"
 #include "clang/Sema/TypoCorrection.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Support/Casting.h"
 #include <optional>
+
 using namespace clang;
 
 ExprResult
@@ -3090,10 +3103,19 @@ ExprResult Parser::ParseGenericSelectionExpression() {
     Diag(Loc, getLangOpts().C2y ? diag::warn_c2y_compat_generic_with_type_arg
                                 : diag::ext_c2y_generic_with_type_arg);
   } else {
-    // C11 6.5.1.1p3 "The controlling expression of a generic selection is
-    // not evaluated."
-    EnterExpressionEvaluationContext Unevaluated(
-        Actions, Sema::ExpressionEvaluationContext::Unevaluated);
+    // Parse in a potentially-evaluated context because the expression may be
+    // evaluated if the user has given name to the selection type (N3785).
+
+    // The evaluation context depends on the language version:
+    // C2y: The expression is potentially evaluated
+    // Pre-C2y: The expression is not evaluated
+    auto ContextType =
+        getLangOpts().C2y
+            ? Sema::ExpressionEvaluationContext::PotentiallyEvaluated
+            : Sema::ExpressionEvaluationContext::Unevaluated;
+
+    EnterExpressionEvaluationContext ControllingExpressionEvaluationContext(
+        Actions, ContextType);
     ControllingExpr = ParseAssignmentExpression();
     if (ControllingExpr.isInvalid()) {
       SkipUntil(tok::r_paren, StopAtSemi);
@@ -3107,40 +3129,156 @@ ExprResult Parser::ParseGenericSelectionExpression() {
   }
 
   SourceLocation DefaultLoc;
-  SmallVector<ParsedType, 12> Types;
+  SmallVector<TypeSourceInfo *, 12> Types;
+  SmallVector<VarDecl *> AssocDecls;
   ExprVector Exprs;
-  do {
-    ParsedType Ty;
-    if (Tok.is(tok::kw_default)) {
-      // C11 6.5.1.1p2 "A generic selection shall have no more than one default
-      // generic association."
-      if (!DefaultLoc.isInvalid()) {
-        Diag(Tok, diag::err_duplicate_default_assoc);
-        Diag(DefaultLoc, diag::note_previous_default_assoc);
-        SkipUntil(tok::r_paren, StopAtSemi);
-        return ExprError();
-      }
-      DefaultLoc = ConsumeToken();
-      Ty = nullptr;
-    } else {
-      ColonProtectionRAIIObject X(*this);
-      TypeResult TR = ParseTypeName(nullptr, DeclaratorContext::Association);
-      if (TR.isInvalid()) {
-        SkipUntil(tok::r_paren, StopAtSemi);
-        return ExprError();
-      }
-      Ty = TR.get();
-    }
-    Types.push_back(Ty);
 
-    if (ExpectAndConsume(tok::colon)) {
-      SkipUntil(tok::r_paren, StopAtSemi);
-      return ExprError();
+  do {
+    TypeSourceInfo *Ty = nullptr;
+    VarDecl *AssocDecl = nullptr;
+    ExprResult ER;
+    {
+      // _If_ there is a name associated with the selection type, it
+      // exists in a very narrow scope. Adding a scope here in the case
+      // there is no name associated with the selection type does not hurt.
+      ParseScope AssocScope(this, Scope::AssocationScope | Scope::DeclScope);
+
+      // TODO
+      Sema::ExpressionEvaluationContext Context =
+          Sema::ExpressionEvaluationContext::ConstantEvaluated;
+      EnterExpressionEvaluationContext PotentiallyDiscarded(
+          Actions, Context, nullptr,
+          Sema::ExpressionEvaluationContextRecord::EK_Other, true);
+
+      if (Tok.is(tok::kw_default)) {
+        // C11 6.5.1.1p2 "A generic selection shall have no more than one
+        // default generic association."
+        if (!DefaultLoc.isInvalid()) {
+          Diag(Tok, diag::err_duplicate_default_assoc);
+          Diag(DefaultLoc, diag::note_previous_default_assoc);
+          SkipUntil(tok::r_paren, StopAtSemi);
+          return ExprError();
+        }
+
+        DefaultLoc = ConsumeToken();
+
+        if (getLangOpts().C2y && Tok.is(tok::identifier)) {
+          if (!ControllingExpr.isUsable()) {
+            // 6.5.2.1: If the generic controlling operand is a type name, then
+            // no generic association's shall be composed of either a generic
+            // declaration name nor default with an identifier.
+            SkipUntil(tok::r_paren, StopAtSemi);
+            Diag(KeyLoc,
+                 diag::err_assoc_type_with_assoc_with_generic_decl_name);
+            return ExprError();
+          }
+          DeclarationName Name;
+
+          bool LValueRef = ControllingExpr.get()->isModifiableLvalue(
+                               Actions.getASTContext()) == Expr::MLV_Valid;
+
+          QualType ControllingExprType =
+              LValueRef
+                  ? Actions.BuildReferenceType(ControllingExpr.get()->getType(),
+                                               true, DefaultLoc, Name)
+                  : ControllingExpr.get()->getType();
+
+          AssocDecl = VarDecl::Create(
+              Actions.getASTContext(), Actions.getCurLexicalContext(),
+              DefaultLoc, DefaultLoc, Tok.getIdentifierInfo(),
+              ControllingExprType, nullptr, StorageClass::SC_None);
+
+          if (!AssocDecl) {
+            SkipUntil(tok::r_paren, StopAtSemi);
+            Diag(Tok, diag::err_assoc_not_decl_like);
+            return ExprError();
+          }
+
+          AssocDecl->setLexicalDeclContext(Actions.getCurLexicalContext());
+          Actions.PushOnScopeChains(AssocDecl, getCurScope()->getDeclParent());
+
+          if (ExpectAndConsume(tok::identifier)) {
+            SkipUntil(tok::r_paren, StopAtSemi);
+            return ExprError();
+          }
+        }
+      } else {
+        // Because we are parsing something that requires a :, tell any tool
+        // that attempts to infer the programmer's intent (for, e.g., the
+        // purpose of issuing diagnostics), not to assume that foo: is a typo
+        // for foo::.
+        ColonProtectionRAIIObject X(*this);
+
+        DeclSpec DS(AttrFactory);
+        ParsedTemplateInfo TI;
+        ParseDeclarationSpecifiers(DS, TI, AS_none,
+                                   DeclSpecContext::DSC_association);
+
+        auto DeclaratorContext = getLangOpts().C2y
+                                     ? DeclaratorContext::AssociationExtended
+                                     : DeclaratorContext::Association;
+        Declarator DeclaratorInfo(DS, ParsedAttributesView::none(),
+                                  DeclaratorContext);
+        ParseDeclarator(DeclaratorInfo);
+
+        Ty = Actions.GetTypeForDeclarator(DeclaratorInfo);
+
+        if (DeclaratorInfo.isInvalidType()) {
+          SkipUntil(tok::r_paren, StopAtSemi);
+          return ExprError();
+        }
+
+        // No longer simply ignore storage classes -- report them
+        // as constraint violations.
+        if (DS.getStorageClassSpec() != DeclSpec::SCS_unspecified) {
+          SkipUntil(tok::r_paren, StopAtSemi);
+          Diag(Tok, diag::err_assoc_cannot_have_sc);
+          return ExprError();
+        }
+
+        // Now, if the declarator has a name, do something extra in C2y mode.
+        if (getLangOpts().C2y && DeclaratorInfo.hasName()) {
+          if (!ControllingExpr.isUsable()) {
+            // 6.5.2.1: If the generic controlling operand is a type name, then
+            // no generic association's shall be composed of either a generic
+            // declaration name nor default with an identifier.
+            SkipUntil(tok::r_paren, StopAtSemi);
+            Diag(KeyLoc,
+                 diag::err_assoc_type_with_assoc_with_generic_decl_name);
+            return ExprError();
+          }
+          // If the controlling expression is an lvalue, turn the variable
+          // into a reference.
+          if (ControllingExpr.get()->isModifiableLvalue(
+                  Actions.getASTContext()) == Expr::MLV_Valid) {
+            SourceLocation NoLoc;
+            DeclaratorInfo.AddInnermostTypeInfo(
+                DeclaratorChunk::getReference(0, NoLoc, true));
+          }
+
+          Decl *S = Actions.ActOnDeclarator(getCurScope(), DeclaratorInfo);
+          AssocDecl = llvm::dyn_cast_or_null<VarDecl>(S);
+
+          if (!AssocDecl) {
+            SkipUntil(tok::r_paren, StopAtSemi);
+            Diag(Tok, diag::err_assoc_not_decl_like);
+            return ExprError();
+          }
+        }
+      }
+      Types.push_back(Ty);
+      AssocDecls.push_back(AssocDecl);
+
+      if (ExpectAndConsume(tok::colon)) {
+        SkipUntil(tok::r_paren, StopAtSemi);
+        return ExprError();
+      }
+
+      ER = ParseAssignmentExpression();
     }
 
     // FIXME: These expressions should be parsed in a potentially potentially
     // evaluated context.
-    ExprResult ER = ParseAssignmentExpression();
     if (ER.isInvalid()) {
       SkipUntil(tok::r_paren, StopAtSemi);
       return ExprError();
@@ -3158,7 +3296,7 @@ ExprResult Parser::ParseGenericSelectionExpression() {
 
   return Actions.ActOnGenericSelectionExpr(
       KeyLoc, DefaultLoc, T.getCloseLocation(), ControllingExpr.isUsable(),
-      ExprOrTy, Types, Exprs);
+      ExprOrTy, Types, AssocDecls, Exprs);
 }
 
 ExprResult Parser::ParseFoldExpression(ExprResult LHS,
@@ -3186,7 +3324,7 @@ ExprResult Parser::ParseFoldExpression(ExprResult LHS,
 
     if (Kind != tok::unknown && Tok.getKind() != Kind)
       Diag(Tok.getLocation(), diag::err_fold_operator_mismatch)
-        << SourceRange(FirstOpLoc);
+          << SourceRange(FirstOpLoc);
     Kind = Tok.getKind();
     ConsumeToken();
 
@@ -3402,7 +3540,6 @@ ExprResult Parser::ParseBlockLiteralExpression() {
     Actions.ActOnBlockArguments(CaretLoc, ParamInfo, getCurScope());
   }
 
-
   ExprResult Result(true);
   if (!Tok.is(tok::l_brace)) {
     // Saw something like: ^expr
@@ -3411,7 +3548,7 @@ ExprResult Parser::ParseBlockLiteralExpression() {
     return ExprError();
   }
   EnterExpressionEvaluationContextForFunction PotentiallyEvaluated(
-       Actions, Sema::ExpressionEvaluationContext::PotentiallyEvaluated);
+      Actions, Sema::ExpressionEvaluationContext::PotentiallyEvaluated);
   StmtResult Stmt(ParseCompoundStatementBody());
   BlockScope.Exit();
   if (!Stmt.isInvalid())

@@ -21,6 +21,7 @@
 #include "clang/AST/TypeBase.h"
 #include "clang/Serialization/ASTReader.h"
 #include "clang/Serialization/ASTRecordWriter.h"
+#include "clang/Serialization/ASTWriter.h"
 #include "llvm/Bitstream/BitstreamWriter.h"
 using namespace clang;
 
@@ -1437,6 +1438,10 @@ void ASTStmtWriter::VisitGenericSelectionExpr(GenericSelectionExpr *E) {
        I < N; ++I)
     Record.AddTypeSourceInfo(TSIs[I]);
 
+  VarDecl **Decls = E->getTrailingObjects<VarDecl *>();
+  for (unsigned I = 0, N = E->getNumAssocs(); I < N; ++I) {
+    Record.AddDeclRef(Decls[I]);
+  }
   Code = serialization::EXPR_GENERIC_SELECTION;
 }
 

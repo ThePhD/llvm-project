@@ -18,6 +18,7 @@
 #include "clang/AST/TypeLoc.h"
 #include "clang/Analysis/DomainSpecific/CocoaConventions.h"
 #include "clang/Basic/Builtins.h"
+#include "clang/Basic/IdentifierTable.h"
 #include "clang/Basic/TargetInfo.h"
 #include "clang/Edit/Commit.h"
 #include "clang/Edit/Rewriters.h"
@@ -4705,6 +4706,7 @@ Expr *SemaObjC::stripARCUnbridgedCast(Expr *e) {
     unsigned n = gse->getNumAssocs();
     SmallVector<Expr *, 4> subExprs;
     SmallVector<TypeSourceInfo *, 4> subTypes;
+    SmallVector<VarDecl *, 4> subIds;
     subExprs.reserve(n);
     subTypes.reserve(n);
     for (const GenericSelectionExpr::Association assoc : gse->associations()) {
@@ -4713,11 +4715,13 @@ Expr *SemaObjC::stripARCUnbridgedCast(Expr *e) {
       if (assoc.isSelected())
         sub = stripARCUnbridgedCast(sub);
       subExprs.push_back(sub);
+
+      subIds.push_back(assoc.getAssocDecl());
     }
 
     return GenericSelectionExpr::Create(
         Context, gse->getGenericLoc(), gse->getControllingExpr(), subTypes,
-        subExprs, gse->getDefaultLoc(), gse->getRParenLoc(),
+        subIds, subExprs, gse->getDefaultLoc(), gse->getRParenLoc(),
         gse->containsUnexpandedParameterPack(), gse->getResultIndex());
   } else {
     assert(isa<ImplicitCastExpr>(e) && "bad form of unbridged cast!");

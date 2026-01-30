@@ -198,7 +198,6 @@ void CodeGenFunction::EmitDecl(const Decl &D, bool EvaluateConditionDecl) {
   }
   }
 }
-
 /// EmitVarDecl - This method handles emission of any variable declaration
 /// inside a function, including static vars etc.
 void CodeGenFunction::EmitVarDecl(const VarDecl &D) {

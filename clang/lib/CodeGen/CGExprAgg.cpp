@@ -115,7 +115,11 @@ public:
   void VisitStmt(Stmt *S) { CGF.ErrorUnsupported(S, "aggregate expression"); }
   void VisitParenExpr(ParenExpr *PE) { Visit(PE->getSubExpr()); }
   void VisitGenericSelectionExpr(GenericSelectionExpr *GE) {
-    Visit(GE->getResultExpr());
+    VarDecl *VD = GE->getResultDecl();
+    if (VD) {
+      CGF.EmitVarDecl(*VD);
+    }
+    return Visit(GE->getResultExpr());
   }
   void VisitCoawaitExpr(CoawaitExpr *E) {
     CGF.EmitCoawaitExpr(*E, Dest, IsResultUnused);

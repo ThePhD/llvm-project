@@ -425,7 +425,7 @@ bool Parser::SkipUntil(ArrayRef<tok::TokenKind> Toks, SkipUntilFlags Flags) {
 // Scope manipulation
 //===----------------------------------------------------------------------===//
 
-void Parser::EnterScope(unsigned ScopeFlags) {
+void Parser::EnterScope(unsigned long ScopeFlags) {
   if (NumCachedScopes) {
     Scope *N = ScopeCache[--NumCachedScopes];
     N->Init(getCurScope(), ScopeFlags);
@@ -451,9 +451,9 @@ void Parser::ExitScope() {
     ScopeCache[NumCachedScopes++] = OldScope;
 }
 
-Parser::ParseScopeFlags::ParseScopeFlags(Parser *Self, unsigned ScopeFlags,
-                                 bool ManageFlags)
-  : CurScope(ManageFlags ? Self->getCurScope() : nullptr) {
+Parser::ParseScopeFlags::ParseScopeFlags(Parser *Self, unsigned long ScopeFlags,
+                                         bool ManageFlags)
+    : CurScope(ManageFlags ? Self->getCurScope() : nullptr) {
   if (CurScope) {
     OldFlags = CurScope->getFlags();
     CurScope->setFlags(ScopeFlags);
