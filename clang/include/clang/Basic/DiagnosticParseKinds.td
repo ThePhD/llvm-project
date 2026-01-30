@@ -163,6 +163,10 @@ def err_duplicate_default_assoc : Error<
   "duplicate default generic association">;
 def note_previous_default_assoc : Note<
   "previous default generic association is here">;
+def err_assoc_not_decl_like : Error<
+  "association must be either typename or declaration">;
+def err_assoc_cannot_have_sc : Error<
+  "association cannot have storage class">;
 def ext_c2y_generic_with_type_arg : Extension<
   "passing a type argument as the first operand to '_Generic' is a C2y "
   "extension">, InGroup<C2y>;

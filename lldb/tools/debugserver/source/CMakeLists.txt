@@ -8,7 +8,7 @@ include_directories(MacOSX/arm64)
 
 function(check_certificate identity result_valid)
   execute_process(
-    COMMAND security find-certificate -Z -p -c ${identity} /Library/Keychains/System.keychain
+    COMMAND security find-certificate -Z -p -c ${identity} /Users/hawkinsw/code/lldb_codesign2.db 
     RESULT_VARIABLE exit_code OUTPUT_QUIET ERROR_QUIET)
   if(exit_code)
     set(${result_valid} FALSE PARENT_SCOPE)

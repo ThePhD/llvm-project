@@ -1480,6 +1480,10 @@ void ASTStmtReader::VisitGenericSelectionExpr(GenericSelectionExpr *E) {
   for (unsigned I = 0, N = NumAssocs + (!E->IsExprPredicate ? 1 : 0); I < N;
        ++I)
     TSIs[I] = readTypeSourceInfo();
+
+  VarDecl **VarDecls = E->getTrailingObjects<VarDecl *>();
+  for (unsigned I = 0, N = NumAssocs; I < N; ++I)
+    VarDecls[I] = readDeclAs<VarDecl>();
 }
 
 void ASTStmtReader::VisitPseudoObjectExpr(PseudoObjectExpr *E) {

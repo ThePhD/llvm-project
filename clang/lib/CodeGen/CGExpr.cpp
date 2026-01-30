@@ -20,6 +20,7 @@
 #include "CGObjCRuntime.h"
 #include "CGOpenMPRuntime.h"
 #include "CGRecordLayout.h"
+#include "CGValue.h"
 #include "CodeGenFunction.h"
 #include "CodeGenModule.h"
 #include "CodeGenPGO.h"
@@ -28,17 +29,21 @@
 #include "clang/AST/ASTContext.h"
 #include "clang/AST/ASTLambda.h"
 #include "clang/AST/Attr.h"
+#include "clang/AST/Decl.h"
+#include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/Expr.h"
 #include "clang/AST/InferAlloc.h"
 #include "clang/AST/MatrixUtils.h"
 #include "clang/AST/NSAPI.h"
+#include "clang/AST/NestedNameSpecifierBase.h"
 #include "clang/AST/ParentMapContext.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/Basic/Builtins.h"
 #include "clang/Basic/CodeGenOptions.h"
 #include "clang/Basic/Module.h"
 #include "clang/Basic/SourceManager.h"
+#include "clang/Basic/Specifiers.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/StringExtras.h"
@@ -1767,9 +1772,14 @@ LValue CodeGenFunction::EmitLValueHelper(const Expr *E,
   }
   case Expr::ParenExprClass:
     return EmitLValue(cast<ParenExpr>(E)->getSubExpr(), IsKnownNonNull);
-  case Expr::GenericSelectionExprClass:
-    return EmitLValue(cast<GenericSelectionExpr>(E)->getResultExpr(),
-                      IsKnownNonNull);
+  case Expr::GenericSelectionExprClass: {
+    const auto *gse = cast<GenericSelectionExpr>(E);
+    const VarDecl *VD = gse->getResultDecl();
+    if (VD) {
+      EmitVarDecl(*VD);
+    }
+    return EmitLValue(gse->getResultExpr(), IsKnownNonNull);
+  }
   case Expr::PredefinedExprClass:
     return EmitPredefinedLValue(cast<PredefinedExpr>(E));
   case Expr::StringLiteralClass:

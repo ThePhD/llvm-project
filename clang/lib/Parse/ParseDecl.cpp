@@ -3070,6 +3070,7 @@ Parser::getDeclSpecContextFromDeclaratorContext(DeclaratorContext Context) {
   case DeclaratorContext::AliasTemplate:
     return DeclSpecContext::DSC_alias_declaration;
   case DeclaratorContext::Association:
+  case DeclaratorContext::AssociationExtended:
     return DeclSpecContext::DSC_association;
   case DeclaratorContext::TypeName:
     return DeclSpecContext::DSC_type_specifier;

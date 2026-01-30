@@ -15,6 +15,7 @@
 #include "CIRGenFunction.h"
 #include "CIRGenValue.h"
 #include "mlir/IR/Builders.h"
+#include "clang/AST/Decl.h"
 #include "clang/CIR/Dialect/IR/CIRAttrs.h"
 
 #include "clang/AST/Expr.h"
@@ -330,6 +331,10 @@ public:
   }
   void VisitParenExpr(ParenExpr *pe) { Visit(pe->getSubExpr()); }
   void VisitGenericSelectionExpr(GenericSelectionExpr *ge) {
+    const VarDecl *vd = ge->getResultDecl();
+    if (vd) {
+      cgf.emitVarDecl(*vd);
+    }
     Visit(ge->getResultExpr());
   }
   void VisitCoawaitExpr(CoawaitExpr *e) {

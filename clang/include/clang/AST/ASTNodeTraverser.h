@@ -262,6 +262,8 @@ public:
       getNodeDelegate().Visit(A);
       if (const TypeSourceInfo *TSI = A.getTypeSourceInfo())
         Visit(TSI->getType());
+      if (const VarDecl *AD = A.getAssocDecl())
+        Visit(AD);
       Visit(A.getAssociationExpr());
     });
   }

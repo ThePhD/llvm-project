@@ -23,6 +23,7 @@
 #include "clang/AST/Decl.h"
 #include "clang/AST/DeclObjC.h"
 #include "clang/AST/DeclTemplate.h"
+#include "clang/AST/DeclarationName.h"
 #include "clang/AST/DynamicRecursiveASTVisitor.h"
 #include "clang/AST/EvaluatedExprVisitor.h"
 #include "clang/AST/Expr.h"
@@ -32,10 +33,14 @@
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/StmtVisitor.h"
 #include "clang/AST/Type.h"
+#include "clang/AST/TypeBase.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Basic/Builtins.h"
 #include "clang/Basic/DiagnosticSema.h"
+#include "clang/Basic/IdentifierTable.h"
+#include "clang/Basic/LangOptions.h"
 #include "clang/Basic/PartialDiagnostic.h"
+#include "clang/Basic/SourceLocation.h"
 #include "clang/Basic/SourceManager.h"
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/TargetInfo.h"
@@ -50,9 +55,11 @@
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/Lookup.h"
 #include "clang/Sema/Overload.h"
+#include "clang/Sema/Ownership.h"
 #include "clang/Sema/ParsedTemplate.h"
 #include "clang/Sema/Scope.h"
 #include "clang/Sema/ScopeInfo.h"
+#include "clang/Sema/Sema.h"
 #include "clang/Sema/SemaAMDGPU.h"
 #include "clang/Sema/SemaARM.h"
 #include "clang/Sema/SemaCUDA.h"
@@ -63,7 +70,9 @@
 #include "clang/Sema/SemaPseudoObject.h"
 #include "clang/Sema/Template.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringExtras.h"
+#include "llvm/Support/Casting.h"
 #include "llvm/Support/ConvertUTF.h"
 #include "llvm/Support/SaveAndRestore.h"
 #include "llvm/Support/TimeProfiler.h"
@@ -1789,21 +1798,13 @@ QualType Sema::UsualArithmeticConversions(ExprResult &LHS, ExprResult &RHS,
 //  Semantic Analysis for various Expression Types
 //===----------------------------------------------------------------------===//
 
-
 ExprResult Sema::ActOnGenericSelectionExpr(
     SourceLocation KeyLoc, SourceLocation DefaultLoc, SourceLocation RParenLoc,
     bool PredicateIsExpr, void *ControllingExprOrType,
-    ArrayRef<ParsedType> ArgTypes, ArrayRef<Expr *> ArgExprs) {
+    ArrayRef<TypeSourceInfo *> ArgTypes, ArrayRef<VarDecl *> ArgAssocDecls, ArrayRef<Expr *> ArgExprs) {
   unsigned NumAssocs = ArgTypes.size();
   assert(NumAssocs == ArgExprs.size());
-
-  TypeSourceInfo **Types = new TypeSourceInfo*[NumAssocs];
-  for (unsigned i = 0; i < NumAssocs; ++i) {
-    if (ArgTypes[i])
-      (void) GetTypeFromParser(ArgTypes[i], &Types[i]);
-    else
-      Types[i] = nullptr;
-  }
+  assert(NumAssocs == ArgAssocDecls.size());
 
   // If we have a controlling type, we need to convert it from a parsed type
   // into a semantic type and then pass that along.
@@ -1817,9 +1818,23 @@ ExprResult Sema::ActOnGenericSelectionExpr(
 
   ExprResult ER = CreateGenericSelectionExpr(
       KeyLoc, DefaultLoc, RParenLoc, PredicateIsExpr, ControllingExprOrType,
-      llvm::ArrayRef(Types, NumAssocs), ArgExprs);
-  delete [] Types;
+      ArgTypes, ArgAssocDecls, ArgExprs);
   return ER;
+}
+
+class TransformAssocExpr : public TreeTransform<TransformAssocExpr> {
+  typedef TreeTransform<TransformAssocExpr> BaseTransform;
+
+public:
+  TransformAssocExpr(Sema &SemaRef) : BaseTransform(SemaRef) {}
+
+  // Make sure we redo semantic analysis
+  bool AlwaysRebuild() { return true; }
+  bool ReplacingOriginal() { return true; }
+};
+
+static ExprResult TransformAssocExprToUpdatedType(Sema &SemaRef, Expr *E) {
+  return TransformAssocExpr(SemaRef).TransformExpr(E);
 }
 
 // Helper function to determine type compatibility for C _Generic expressions.
@@ -1848,30 +1863,80 @@ static bool areTypesCompatibleForGeneric(ASTContext &Ctx, QualType T,
 ExprResult Sema::CreateGenericSelectionExpr(
     SourceLocation KeyLoc, SourceLocation DefaultLoc, SourceLocation RParenLoc,
     bool PredicateIsExpr, void *ControllingExprOrType,
-    ArrayRef<TypeSourceInfo *> Types, ArrayRef<Expr *> Exprs) {
+    ArrayRef<TypeSourceInfo *> Types, ArrayRef<VarDecl *> AssocDecls,
+    ArrayRef<Expr *> Exprs) {
   unsigned NumAssocs = Types.size();
   assert(NumAssocs == Exprs.size());
   assert(ControllingExprOrType &&
          "Must have either a controlling expression or a controlling type");
 
-  Expr *ControllingExpr = nullptr;
-  TypeSourceInfo *ControllingType = nullptr;
-  if (PredicateIsExpr) {
+  auto CreateDecayedType = [this](Expr *ControllingExpr) {
     // Decay and strip qualifiers for the controlling expression type, and
     // handle placeholder type replacement. See committee discussion from WG14
     // DR423.
+    // TODO: Determine whether this evaluation context is correct.
     EnterExpressionEvaluationContext Unevaluated(
         *this, Sema::ExpressionEvaluationContext::Unevaluated);
-    ExprResult R = DefaultFunctionArrayLvalueConversion(
-        reinterpret_cast<Expr *>(ControllingExprOrType));
+    ExprResult R = DefaultFunctionArrayLvalueConversion(ControllingExpr);
     if (R.isInvalid())
       return ExprError();
-    ControllingExpr = R.get();
+    return R;
+  };
+
+  auto GetControllingRangeAndType = [](Expr *ControllingExpr,
+                                       TypeSourceInfo *ControllingType) {
+    // We strip parens here because the controlling expression is typically
+    // parenthesized in macro definitions.
+    if (ControllingExpr)
+      ControllingExpr = ControllingExpr->IgnoreParens();
+
+    SourceRange SR = ControllingExpr
+                         ? ControllingExpr->getSourceRange()
+                         : ControllingType->getTypeLoc().getSourceRange();
+    QualType QT = ControllingExpr ? ControllingExpr->getType()
+                                  : ControllingType->getType();
+
+    return std::make_pair(SR, QT);
+  };
+
+  // AssocDecls will only contain non-null value when created during parsing --
+  // a fact limited by the proper language settings. In other words, checking
+  // the contents of AssocDecls is sufficient to determine whether to use
+  // multipass matching.
+  bool MultiPassMatching = LangOpts.C2y;
+
+  Expr *ControllingExpr = nullptr;
+  Expr *OriginalControllingExpr = nullptr;
+  TypeSourceInfo *ControllingType = nullptr;
+  if (PredicateIsExpr) {
+    OriginalControllingExpr = reinterpret_cast<Expr *>(ControllingExprOrType);
+    // C2y:
+    // If the generic controlling operand is an assignment expression, the
+    // controlling type of the generic selection expression is ... first the
+    // type of the expression. If no generic association type has a compatible
+    // type with this first type, then the controlling type of the generic
+    // selection expression is as if it had undergone an lvalue conversion,FN)
+    // array to pointer conversion, or function to pointer conversion.
+    if (LangOpts.C2y) {
+      // Do not decay until we have to!
+      ControllingExpr = OriginalControllingExpr;
+    } else {
+      // The type of the controlling expression is the type of the expression as
+      // if it had undergone an lvalue conversion,105) array to pointer
+      // conversion, or function to pointer conversion
+      auto R = CreateDecayedType(OriginalControllingExpr);
+      if (R.isInvalid())
+        return R;
+      ControllingExpr = R.get();
+    }
   } else {
     // The extension form uses the type directly rather than converting it.
     ControllingType = reinterpret_cast<TypeSourceInfo *>(ControllingExprOrType);
     if (!ControllingType)
       return ExprError();
+
+    // Note: Parser has guaranteed that when the controlling operand is a type,
+    // no association uses the generic declaration name form.
   }
 
   bool TypeErrorFound = false,
@@ -1883,6 +1948,9 @@ ExprResult Sema::CreateGenericSelectionExpr(
                ? ControllingExpr->containsUnexpandedParameterPack()
                : ControllingType->getType()->containsUnexpandedParameterPack();
 
+  // TODO: Do not issue these warnings if
+  // 1. This _Generic has assocations with generic association names, and
+  // 2. One of those associations with generic associations is selected.
   // The controlling expression is an unevaluated operand, so side effects are
   // likely unintended.
   if (!inTemplateInstantiation() && !IsResultDependent && ControllingExpr &&
@@ -1942,18 +2010,20 @@ ExprResult Sema::CreateGenericSelectionExpr(
           // NB: this does not apply when the first operand is a type rather
           // than an expression, because the type form does not undergo
           // conversion.
-          unsigned Reason = 0;
-          QualType QT = Types[i]->getType();
-          if (QT->isArrayType())
-            Reason = 1;
-          else if (QT.hasQualifiers() &&
-                   (!LangOpts.CPlusPlus || !QT->isRecordType()))
-            Reason = 2;
+          if (!MultiPassMatching) {
+            unsigned Reason = 0;
+            QualType QT = Types[i]->getType();
+            if (QT->isArrayType())
+              Reason = 1;
+            else if (QT.hasQualifiers() &&
+                     (!LangOpts.CPlusPlus || !QT->isRecordType()))
+              Reason = 2;
 
-          if (Reason)
-            Diag(Types[i]->getTypeLoc().getBeginLoc(),
-                 diag::warn_unreachable_association)
-                << QT << (Reason - 1);
+            if (Reason)
+              Diag(Types[i]->getTypeLoc().getBeginLoc(),
+                   diag::warn_unreachable_association)
+                  << QT << (Reason - 1);
+          }
         }
 
         if (D != 0) {
@@ -1967,19 +2037,17 @@ ExprResult Sema::CreateGenericSelectionExpr(
 
         // C11 6.5.1.1p2 "No two generic associations in the same generic
         // selection shall specify compatible types."
-        for (unsigned j = i+1; j < NumAssocs; ++j)
+        for (unsigned j = i + 1; j < NumAssocs; ++j)
           if (Types[j] && !Types[j]->getType()->isDependentType() &&
               areTypesCompatibleForGeneric(Context, Types[i]->getType(),
                                            Types[j]->getType())) {
             Diag(Types[j]->getTypeLoc().getBeginLoc(),
                  diag::err_assoc_compatible_types)
-              << Types[j]->getTypeLoc().getSourceRange()
-              << Types[j]->getType()
-              << Types[i]->getType();
-            Diag(Types[i]->getTypeLoc().getBeginLoc(),
-                 diag::note_compat_assoc)
-              << Types[i]->getTypeLoc().getSourceRange()
-              << Types[i]->getType();
+                << Types[j]->getTypeLoc().getSourceRange()
+                << Types[j]->getType() << Types[i]->getType();
+            Diag(Types[i]->getTypeLoc().getBeginLoc(), diag::note_compat_assoc)
+                << Types[i]->getTypeLoc().getSourceRange()
+                << Types[i]->getType();
             TypeErrorFound = true;
           }
       }
@@ -1992,97 +2060,150 @@ ExprResult Sema::CreateGenericSelectionExpr(
   // try to compute the result expression.
   if (IsResultDependent) {
     if (ControllingExpr)
-      return GenericSelectionExpr::Create(Context, KeyLoc, ControllingExpr,
-                                          Types, Exprs, DefaultLoc, RParenLoc,
-                                          ContainsUnexpandedParameterPack);
-    return GenericSelectionExpr::Create(Context, KeyLoc, ControllingType, Types,
-                                        Exprs, DefaultLoc, RParenLoc,
-                                        ContainsUnexpandedParameterPack);
+      return GenericSelectionExpr::Create(
+          Context, KeyLoc, ControllingExpr, Types, AssocDecls, Exprs,
+          DefaultLoc, RParenLoc, ContainsUnexpandedParameterPack);
+    return GenericSelectionExpr::Create(
+        Context, KeyLoc, ControllingType, Types, AssocDecls, Exprs, DefaultLoc,
+        RParenLoc, ContainsUnexpandedParameterPack);
   }
 
-  SmallVector<unsigned, 1> CompatIndices;
-  unsigned DefaultIndex = std::numeric_limits<unsigned>::max();
-  // Look at the canonical type of the controlling expression in case it was a
-  // deduced type like __auto_type. However, when issuing diagnostics, use the
-  // type the user wrote in source rather than the canonical one.
-  for (unsigned i = 0; i < NumAssocs; ++i) {
-    if (!Types[i])
-      DefaultIndex = i;
-    else {
-      bool Compatible;
-      QualType ControllingQT =
-          ControllingExpr ? ControllingExpr->getType().getCanonicalType()
-                          : ControllingType->getType().getCanonicalType();
-      QualType AssocQT = Types[i]->getType();
+  auto GetCompatibleIndexes = [&NumAssocs, &Types,
+                               this](Expr *ControllingExpr,
+                                     TypeSourceInfo *ControllingType) {
+    SmallVector<unsigned, 1> CompatIndices;
+    unsigned DefaultIndex = std::numeric_limits<unsigned>::max();
+    // Look at the canonical type of the controlling expression in case it
+    // was a deduced type like __auto_type. However, when issuing
+    // diagnostics, use the type the user wrote in source rather than the
+    // canonical one.
+    for (unsigned i = 0; i < NumAssocs; ++i) {
+      if (!Types[i])
+        DefaultIndex = i;
+      else {
+        bool Compatible;
+        QualType ControllingQT =
+            ControllingExpr ? ControllingExpr->getType().getCanonicalType()
+                            : ControllingType->getType().getCanonicalType();
+        QualType AssocQT = Types[i]->getType();
 
-      Compatible =
-          areTypesCompatibleForGeneric(Context, ControllingQT, AssocQT);
+        Compatible =
+            areTypesCompatibleForGeneric(Context, ControllingQT, AssocQT);
 
-      if (Compatible)
-        CompatIndices.push_back(i);
+        if (Compatible)
+          CompatIndices.push_back(i);
+      }
     }
-  }
-
-  auto GetControllingRangeAndType = [](Expr *ControllingExpr,
-                                       TypeSourceInfo *ControllingType) {
-    // We strip parens here because the controlling expression is typically
-    // parenthesized in macro definitions.
-    if (ControllingExpr)
-      ControllingExpr = ControllingExpr->IgnoreParens();
-
-    SourceRange SR = ControllingExpr
-                         ? ControllingExpr->getSourceRange()
-                         : ControllingType->getTypeLoc().getSourceRange();
-    QualType QT = ControllingExpr ? ControllingExpr->getType()
-                                  : ControllingType->getType();
-
-    return std::make_pair(SR, QT);
+    return std::make_pair(DefaultIndex, CompatIndices);
   };
 
-  // C11 6.5.1.1p2 "The controlling expression of a generic selection shall have
-  // type compatible with at most one of the types named in its generic
-  // association list."
-  if (CompatIndices.size() > 1) {
-    auto P = GetControllingRangeAndType(ControllingExpr, ControllingType);
-    SourceRange SR = P.first;
-    Diag(SR.getBegin(), diag::err_generic_sel_multi_match)
-        << SR << P.second << (unsigned)CompatIndices.size();
-    for (unsigned I : CompatIndices) {
-      Diag(Types[I]->getTypeLoc().getBeginLoc(),
-           diag::note_compat_assoc)
-        << Types[I]->getTypeLoc().getSourceRange()
-        << Types[I]->getType();
+  // In C2y, look for an association type that is compatible
+  // with the actual type of the controlling expression before
+  // decaying.
+  bool LastChance = !LangOpts.C2y || !ControllingExpr;
+
+  do {
+    SmallVector<unsigned, 1> CompatIndices;
+    unsigned DefaultIndex = std::numeric_limits<unsigned>::max();
+    auto CompatibleIndexesSearchResult =
+        GetCompatibleIndexes(ControllingExpr, ControllingType);
+
+    DefaultIndex = std::get<0>(CompatibleIndexesSearchResult);
+    CompatIndices = std::get<1>(CompatibleIndexesSearchResult);
+
+    // C11 6.5.1.1p2 "The controlling expression of a generic selection shall
+    // have type compatible with at most one of the types named in its generic
+    // association list."
+    if (CompatIndices.size() > 1) {
+      auto P = GetControllingRangeAndType(ControllingExpr, ControllingType);
+      SourceRange SR = P.first;
+      Diag(SR.getBegin(), diag::err_generic_sel_multi_match)
+          << SR << P.second << (unsigned)CompatIndices.size();
+      for (unsigned I : CompatIndices) {
+        Diag(Types[I]->getTypeLoc().getBeginLoc(), diag::note_compat_assoc)
+            << Types[I]->getTypeLoc().getSourceRange() << Types[I]->getType();
+      }
+      return ExprError();
     }
-    return ExprError();
-  }
 
-  // C11 6.5.1.1p2 "If a generic selection has no default generic association,
-  // its controlling expression shall have type compatible with exactly one of
-  // the types named in its generic association list."
-  if (DefaultIndex == std::numeric_limits<unsigned>::max() &&
-      CompatIndices.size() == 0) {
-    auto P = GetControllingRangeAndType(ControllingExpr, ControllingType);
-    SourceRange SR = P.first;
-    Diag(SR.getBegin(), diag::err_generic_sel_no_match) << SR << P.second;
-    return ExprError();
-  }
+    if ((CompatIndices.size() == 0 || (CompatIndices[0] == DefaultIndex)) &&
+        !LastChance) {
+      LastChance = true;
+      auto R = CreateDecayedType(ControllingExpr);
+      if (R.isInvalid())
+        return R;
+      ControllingExpr = R.get();
+      continue;
+    }
 
-  // C11 6.5.1.1p3 "If a generic selection has a generic association with a
-  // type name that is compatible with the type of the controlling expression,
-  // then the result expression of the generic selection is the expression
-  // in that generic association. Otherwise, the result expression of the
-  // generic selection is the expression in the default generic association."
-  unsigned ResultIndex =
-    CompatIndices.size() ? CompatIndices[0] : DefaultIndex;
+    // C11 6.5.1.1p2 "If a generic selection has no default generic association,
+    // its controlling expression shall have type compatible with exactly one of
+    // the types named in its generic association list."
+    if (DefaultIndex == std::numeric_limits<unsigned>::max() &&
+        CompatIndices.size() == 0) {
+      auto P = GetControllingRangeAndType(ControllingExpr, ControllingType);
+      SourceRange SR = P.first;
+      Diag(SR.getBegin(), diag::err_generic_sel_no_match) << SR << P.second;
+      return ExprError();
+    }
 
-  if (ControllingExpr) {
+    // C11 6.5.1.1p3 "If a generic selection has a generic association with a
+    // type name that is compatible with the type of the controlling expression,
+    // then the result expression of the generic selection is the expression
+    // in that generic association. Otherwise, the result expression of the
+    // generic selection is the expression in the default generic association."
+    unsigned ResultIndex =
+        CompatIndices.size() ? CompatIndices[0] : DefaultIndex;
+
+    if (ControllingExpr) {
+
+      SmallVector<Expr *, 4> RebuiltExprs;
+      for (unsigned i = 0; i < NumAssocs; ++i) {
+        RebuiltExprs.push_back(Exprs[i]);
+
+        Decl *S = AssocDecls[i];
+        VarDecl *VD = nullptr;
+
+        // C2y: If there is a generic association name ...
+        if (S && (VD = llvm::dyn_cast_or_null<VarDecl>(S))) {
+          // C2y: ... and it is the one selected ...
+          if (i == ResultIndex) {
+            // C2y: ... update the type of the name to be the type
+            // of the controlling expression (not the decayed version).
+            VD->setType(OriginalControllingExpr->getType());
+            if (OriginalControllingExpr->isModifiableLvalue(getASTContext()) ==
+                Expr::MLV_Valid) {
+              SourceLocation NoLoc;
+              DeclarationName NoName;
+              VD->setType(
+                  BuildReferenceType(VD->getType(), true, NoLoc, NoName));
+            }
+            ExprResult R = TransformAssocExprToUpdatedType(*this, Exprs[i]);
+            if (R.isInvalid()) {
+              return R;
+            }
+            RebuiltExprs[i] = R.get();
+            // TODO: Check that even if the generic association name is unused
+            // in the generic association it is still evaluated for side effects
+            // (void expression).
+            AddInitializerToDecl(VD, OriginalControllingExpr, true);
+          }
+          FinalizeDeclaration(VD);
+        }
+      }
+      // No matter whether we are in C2y or not, use ControllingExpr here:
+      // If an association matched the original constrolling expression's type,
+      // ControllingExpr will be the original controlling expression;
+      // If an association did not match the original controlling expression's
+      // type, then ControllingExpr will be the decayed controlling expression.
+      return GenericSelectionExpr::Create(
+          Context, KeyLoc, ControllingExpr, Types, AssocDecls, RebuiltExprs,
+          DefaultLoc, RParenLoc, ContainsUnexpandedParameterPack, ResultIndex);
+    }
     return GenericSelectionExpr::Create(
-        Context, KeyLoc, ControllingExpr, Types, Exprs, DefaultLoc, RParenLoc,
-        ContainsUnexpandedParameterPack, ResultIndex);
-  }
-  return GenericSelectionExpr::Create(
-      Context, KeyLoc, ControllingType, Types, Exprs, DefaultLoc, RParenLoc,
-      ContainsUnexpandedParameterPack, ResultIndex);
+        Context, KeyLoc, ControllingType, Types, AssocDecls, Exprs, DefaultLoc,
+        RParenLoc, ContainsUnexpandedParameterPack, ResultIndex);
+  } while (true);
 }
 
 static PredefinedIdentKind getPredefinedExprKind(tok::TokenKind Kind) {
@@ -20400,7 +20521,7 @@ static ExprResult rebuildPotentialResultsAsNonOdrUsed(Sema &S, Expr *E,
     return AnyChanged ? S.CreateGenericSelectionExpr(
                             GSE->getGenericLoc(), GSE->getDefaultLoc(),
                             GSE->getRParenLoc(), IsExpr, ExOrTy,
-                            GSE->getAssocTypeSourceInfos(), AssocExprs)
+                            GSE->getAssocTypeSourceInfos(), GSE->getAssocDecls(), AssocExprs)
                       : ExprEmpty();
   }
 
