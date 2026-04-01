@@ -132,6 +132,8 @@ PPKEYWORD(pragma)
 
 // C23 & C++26 #embed
 PPKEYWORD(embed)
+// C++29 #depend
+PPKEYWORD(depend)
 
 // C++20 Module Directive
 PPKEYWORD(module)

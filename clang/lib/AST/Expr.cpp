@@ -2256,9 +2256,11 @@ bool BinaryOperator::isNullPointerArithmeticExtension(ASTContext &Ctx,
 SourceLocExpr::SourceLocExpr(const ASTContext &Ctx, SourceLocIdentKind Kind,
                              QualType ResultTy, SourceLocation BLoc,
                              SourceLocation RParenLoc,
-                             DeclContext *ParentContext)
+                             DeclContext *ParentContext,
+                             Expr *CallStackDistance)
     : Expr(SourceLocExprClass, ResultTy, VK_PRValue, OK_Ordinary),
-      BuiltinLoc(BLoc), RParenLoc(RParenLoc), ParentContext(ParentContext) {
+      BuiltinLoc(BLoc), RParenLoc(RParenLoc), ParentContext(ParentContext),
+      CallStackDistance(CallStackDistance) {
   SourceLocExprBits.Kind = llvm::to_underlying(Kind);
   // In dependent contexts, function names may change.
   setDependence(MayBeDependent(Kind) && ParentContext->isDependentContext()
@@ -2286,8 +2288,9 @@ StringRef SourceLocExpr::getBuiltinStr() const {
   llvm_unreachable("unexpected IdentKind!");
 }
 
-APValue SourceLocExpr::EvaluateInContext(const ASTContext &Ctx,
-                                         const Expr *DefaultExpr) const {
+APValue SourceLocExpr::EvaluateInContext(
+    const ASTContext &Ctx, const Expr *DefaultExpr,
+    std::optional<SourceLocation> PrecomputedLoc) const {
   SourceLocation Loc;
   const DeclContext *Context;
 
@@ -2301,6 +2304,9 @@ APValue SourceLocExpr::EvaluateInContext(const ASTContext &Ctx,
   } else {
     Loc = getLocation();
     Context = getParentContext();
+  }
+  if (PrecomputedLoc) {
+    Loc = *PrecomputedLoc;
   }
 
   // If we are currently parsing a lambda declarator, we might not have a fully

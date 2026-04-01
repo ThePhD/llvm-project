@@ -2609,12 +2609,6 @@ ExprResult Parser::ParseBuiltinPrimaryExpression() {
   case tok::kw___builtin_FUNCSIG:
   case tok::kw___builtin_LINE:
   case tok::kw___builtin_source_location: {
-    // Attempt to consume the r-paren.
-    if (Tok.isNot(tok::r_paren)) {
-      Diag(Tok, diag::err_expected) << tok::r_paren;
-      SkipUntil(tok::r_paren, StopAtSemi);
-      return ExprError();
-    }
     SourceLocIdentKind Kind = [&] {
       switch (T) {
       case tok::kw___builtin_FILE:
@@ -2635,7 +2629,25 @@ ExprResult Parser::ParseBuiltinPrimaryExpression() {
         llvm_unreachable("invalid keyword");
       }
     }();
-    Res = Actions.ActOnSourceLocExpr(Kind, StartLoc, ConsumeParen());
+    Expr *CallStackDistanceExpr = nullptr;
+    if (Kind == SourceLocIdentKind::SourceLocStruct &&
+        Tok.isNot(tok::r_paren)) {
+      // optional expression for traveling up the stack
+      ExprResult MaybeCallStackDistanceExpr(ParseAssignmentExpression());
+      if (MaybeCallStackDistanceExpr.isInvalid()) {
+        SkipUntil(tok::r_paren, StopAtSemi);
+        return ExprError();
+      }
+      CallStackDistanceExpr = MaybeCallStackDistanceExpr.get();
+    }
+    // Check for the final r-paren.
+    if (Tok.isNot(tok::r_paren)) {
+      Diag(Tok, diag::err_expected) << tok::r_paren;
+      SkipUntil(tok::r_paren, StopAtSemi);
+      return ExprError();
+    }
+    Res = Actions.ActOnSourceLocExpr(Kind, StartLoc, ConsumeParen(),
+                                     CallStackDistanceExpr);
     break;
   }
   }
