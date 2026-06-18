@@ -11187,7 +11187,8 @@ def err_generic_sel_no_match : Error<
   "controlling expression type %0 not compatible with any generic association type">;
 def err_generic_sel_multi_match : Error<
   "controlling expression type %0 compatible with %1 generic association types">;
-
+def err_assoc_type_with_assoc_with_generic_decl_name : Error<
+  "use of type as generic controlling operand is incompatible with assocations with generic association names">;
 
 // Blocks
 def err_blocks_disable : Error<"blocks support disabled - compile with -fblocks"

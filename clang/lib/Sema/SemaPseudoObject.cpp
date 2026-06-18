@@ -33,6 +33,7 @@
 #include "clang/AST/ExprCXX.h"
 #include "clang/AST/ExprObjC.h"
 #include "clang/Basic/CharInfo.h"
+#include "clang/Basic/IdentifierTable.h"
 #include "clang/Lex/Preprocessor.h"
 #include "clang/Sema/Initialization.h"
 #include "clang/Sema/ScopeInfo.h"
@@ -140,8 +141,10 @@ namespace {
 
         SmallVector<Expr *, 8> assocExprs;
         SmallVector<TypeSourceInfo *, 8> assocTypes;
+        SmallVector<VarDecl*, 8> assocIds;
         assocExprs.reserve(numAssocs);
         assocTypes.reserve(numAssocs);
+        assocIds.reserve(numAssocs);
 
         for (const GenericSelectionExpr::Association assoc :
              gse->associations()) {
@@ -150,16 +153,17 @@ namespace {
             assocExpr = rebuild(assocExpr);
           assocExprs.push_back(assocExpr);
           assocTypes.push_back(assoc.getTypeSourceInfo());
+          assocIds.push_back(assoc.getAssocDecl());
         }
 
         if (gse->isExprPredicate())
           return GenericSelectionExpr::Create(
               S.Context, gse->getGenericLoc(), gse->getControllingExpr(),
-              assocTypes, assocExprs, gse->getDefaultLoc(), gse->getRParenLoc(),
+              assocTypes, assocIds, assocExprs, gse->getDefaultLoc(), gse->getRParenLoc(),
               gse->containsUnexpandedParameterPack(), resultIndex);
         return GenericSelectionExpr::Create(
             S.Context, gse->getGenericLoc(), gse->getControllingType(),
-            assocTypes, assocExprs, gse->getDefaultLoc(), gse->getRParenLoc(),
+            assocTypes, assocIds, assocExprs, gse->getDefaultLoc(), gse->getRParenLoc(),
             gse->containsUnexpandedParameterPack(), resultIndex);
       }
 

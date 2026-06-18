@@ -20,6 +20,7 @@
 #include "clang/AST/Attr.h"
 #include "clang/AST/AttrIterator.h"
 #include "clang/AST/CharUnits.h"
+#include "clang/AST/Decl.h"
 #include "clang/AST/DeclBase.h"
 #include "clang/AST/DeclCXX.h"
 #include "clang/AST/DeclTemplate.h"
@@ -32,6 +33,7 @@
 #include "clang/AST/OperationKinds.h"
 #include "clang/AST/StmtCXX.h"
 #include "clang/AST/Type.h"
+#include "clang/AST/TypeBase.h"
 #include "clang/AST/TypeLoc.h"
 #include "clang/Analysis/Analyses/LifetimeSafety/LifetimeAnnotations.h"
 #include "clang/Basic/AttrSubjectMatchRules.h"
@@ -50,6 +52,7 @@
 #include "clang/Basic/PartialDiagnostic.h"
 #include "clang/Basic/PragmaKinds.h"
 #include "clang/Basic/SourceLocation.h"
+#include "clang/Basic/SourceManager.h"
 #include "clang/Basic/Specifiers.h"
 #include "clang/Basic/StackExhaustionHandler.h"
 #include "clang/Basic/TemplateKinds.h"
@@ -7389,7 +7392,8 @@ public:
                                        SourceLocation RParenLoc,
                                        bool PredicateIsExpr,
                                        void *ControllingExprOrType,
-                                       ArrayRef<ParsedType> ArgTypes,
+                                       ArrayRef<TypeSourceInfo *> ArgTypes,
+                                       ArrayRef<VarDecl*> ArgIds,
                                        ArrayRef<Expr *> ArgExprs);
   /// ControllingExprOrType is either a TypeSourceInfo * or an Expr *. FIXME:
   /// it'd be better to split this interface into two so we don't take a
@@ -7401,6 +7405,7 @@ public:
                                         bool PredicateIsExpr,
                                         void *ControllingExprOrType,
                                         ArrayRef<TypeSourceInfo *> Types,
+                                        ArrayRef<VarDecl*> Ids,
                                         ArrayRef<Expr *> Exprs);
 
   // Binary/Unary Operators.  'Tok' is the token for the operator.

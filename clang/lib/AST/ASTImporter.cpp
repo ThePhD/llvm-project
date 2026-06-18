@@ -7753,29 +7753,34 @@ ASTNodeImporter::VisitGenericSelectionExpr(GenericSelectionExpr *E) {
   if (Error Err = ImportContainerChecked(FromAssocExprs, ToAssocExprs))
     return std::move(Err);
 
+  ArrayRef<const VarDecl *> FromAssocDecls(E->getAssocDecls());
+  SmallVector<VarDecl *, 1> ToAssocDecls(FromAssocDecls.size());
+  if (Error Err = ImportContainerChecked(FromAssocDecls, ToAssocDecls))
+    return std::move(Err);
+
   const ASTContext &ToCtx = Importer.getToContext();
   if (E->isResultDependent()) {
     if (ToControllingExpr) {
       return GenericSelectionExpr::Create(
           ToCtx, ToGenericLoc, ToControllingExpr, ArrayRef(ToAssocTypes),
-          ArrayRef(ToAssocExprs), ToDefaultLoc, ToRParenLoc,
+          ToAssocDecls, ArrayRef(ToAssocExprs), ToDefaultLoc, ToRParenLoc,
           E->containsUnexpandedParameterPack());
     }
     return GenericSelectionExpr::Create(
         ToCtx, ToGenericLoc, ToControllingType, ArrayRef(ToAssocTypes),
-        ArrayRef(ToAssocExprs), ToDefaultLoc, ToRParenLoc,
+        ToAssocDecls, ArrayRef(ToAssocExprs), ToDefaultLoc, ToRParenLoc,
         E->containsUnexpandedParameterPack());
   }
 
   if (ToControllingExpr) {
     return GenericSelectionExpr::Create(
         ToCtx, ToGenericLoc, ToControllingExpr, ArrayRef(ToAssocTypes),
-        ArrayRef(ToAssocExprs), ToDefaultLoc, ToRParenLoc,
+        ToAssocDecls, ArrayRef(ToAssocExprs), ToDefaultLoc, ToRParenLoc,
         E->containsUnexpandedParameterPack(), E->getResultIndex());
   }
   return GenericSelectionExpr::Create(
       ToCtx, ToGenericLoc, ToControllingType, ArrayRef(ToAssocTypes),
-      ArrayRef(ToAssocExprs), ToDefaultLoc, ToRParenLoc,
+      ToAssocDecls, ArrayRef(ToAssocExprs), ToDefaultLoc, ToRParenLoc,
       E->containsUnexpandedParameterPack(), E->getResultIndex());
 }
 
